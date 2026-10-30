@@ -1,7 +1,7 @@
 <#
     base installer for Windows — downloads a release binary and hands off to `base install`.
 
-        irm https://raw.githubusercontent.com/ChristopherKahler/base/main/install.ps1 | iex
+        irm https://raw.githubusercontent.com/Mino1289/basemode-ai/main/install.ps1 | iex
 
     No Rust toolchain, no MSVC, no LLVM.
 
@@ -19,7 +19,7 @@
 & {
     $ErrorActionPreference = 'Stop'
 
-    $repo = 'ChristopherKahler/base'
+    $repo = 'Mino1289/basemode-ai'
 
     function Die($msg) { throw $msg }
     function Say($msg) { Write-Host $msg }
@@ -154,7 +154,7 @@
             Say ''
             Say 'base: the hooks were not wired, so base will not do anything yet.'
             Say '  Re-run the line below; if it happens twice, please report it at'
-            Say '  https://github.com/ChristopherKahler/base/issues'
+            Say '  https://github.com/Mino1289/basemode-ai/issues'
             Say ''
             Say '    base install'
             Say ''
@@ -163,7 +163,7 @@
     catch {
         Write-Host ''
         Write-Host "base install failed: $($_.Exception.Message)"
-        Write-Host 'Nothing was changed on your PATH. Report at https://github.com/ChristopherKahler/base/issues'
+        Write-Host 'Nothing was changed on your PATH. Report at https://github.com/Mino1289/basemode-ai/issues'
         # Re-raise. Printing and returning would make a failed install
         # indistinguishable from a successful one to anything that checks a
         # status: CI, a wrapper script, or a user chaining `&&`. `throw` is the

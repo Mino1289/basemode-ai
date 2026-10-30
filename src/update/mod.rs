@@ -32,7 +32,7 @@ use anyhow::{bail, Context, Result};
 
 /// Public releases API — the same artifacts the release workflow publishes.
 const LATEST_RELEASE_API: &str =
-    "https://api.github.com/repos/ChristopherKahler/base/releases/latest";
+    "https://api.github.com/repos/Mino1289/basemode-ai/releases/latest";
 
 /// GitHub rejects API requests without one.
 const USER_AGENT: &str = "base-cli-updater";

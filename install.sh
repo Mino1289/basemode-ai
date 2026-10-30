@@ -1,7 +1,7 @@
 #!/bin/sh
 # base installer — downloads a release binary and hands off to `base install`.
 #
-#   curl -fsSL https://raw.githubusercontent.com/ChristopherKahler/base/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Mino1289/basemode-ai/main/install.sh | sh
 #
 # No Rust toolchain, no compiler. Everything after the download is `base install`
 # doing what it already does: copy the binary to ~/.local/bin/base, write
@@ -15,7 +15,7 @@
 
 set -eu
 
-REPO="ChristopherKahler/base"
+REPO="Mino1289/basemode-ai"
 INSTALL_ARGS="${BASE_INSTALL_ARGS:-}${*:+ $*}"
 
 say()  { printf '%s\n' "$*"; }
@@ -117,7 +117,7 @@ if [ ! -f "$root/.claude/settings.json" ]; then
   say ""
   say "base: the hooks were not wired, so base will not do anything yet."
   say "  Re-run the line below; if it happens twice, please report it at"
-  say "  https://github.com/ChristopherKahler/base/issues"
+  say "  https://github.com/Mino1289/basemode-ai/issues"
   say ""
   say "    base install"
   say ""
