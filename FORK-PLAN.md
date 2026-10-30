@@ -23,11 +23,22 @@ Harness detail: [docs/harnesses.md](harnesses.md). Release signing:
    keygen placeholder — deliberately, because a binary that cannot verify its
    own updates is a binary that can never update.
 
+## In progress
+
+| # | Work | Where |
+|---|---|---|
+| 1.5 | Harness adapters — foundation landed: `Harness`, `inbound`/`outbound`, `Binding`, `--harness` on `hook`/`install`/`uninstall` | `8247447`, detail in [HARNESS-PLAN.md](HARNESS-PLAN.md) |
+
+The three adapters (OpenCode, Cursor, Copilot) are stubs with real detection and
+paths; the install-time harness selection is the next step. Worktrees
+`harness-opencode`, `harness-cursor` and `harness-copilot` are branched from
+`8247447` for the parallel build.
+
 ## Next
 
 | # | Work | Why | Blocked by |
 |---|---|---|---|
-| 1.5 | Harness adapters (OpenCode first, then Cursor, then Copilot) | Claude Code is not installed; today's hooks are dangling | — |
+| 1.6 | Install-time harness selection: prompt + `--harness a,b` list | an install that claims success and wires nothing is the failure this fork exists to fix | — |
 | 3 | Install footprint: `pip --user`/venv, `--project` hook scope | `base install` mutates the Python environment and the global agent config | — |
 | 4 | Scrub on every graph write, `.base/.gitignore` | a pasted secret in a decision lands in `.base/graph.nq`, which is meant to be committed | — |
 | 5 | `SECURITY.md`, signed tags, verify-before-install docs | disclosure path and provenance | — |
