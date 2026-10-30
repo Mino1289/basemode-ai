@@ -57,14 +57,21 @@ fi
 asset="base-${os_tag}-${arch_tag}.tar.gz"
 
 if [ -n "${BASE_VERSION:-}" ]; then
-  url="https://github.com/$REPO/releases/download/${BASE_VERSION}/${asset}"
+  base_url="https://github.com/$REPO/releases/download/${BASE_VERSION}"
   label="$BASE_VERSION"
 else
-  url="https://github.com/$REPO/releases/latest/download/${asset}"
+  base_url="https://github.com/$REPO/releases/latest/download"
   label="latest"
 fi
+url="$base_url/$asset"
 
-# ── download, unpack, hand off ───────────────────────────────────────────────
+# The release signing key, byte for byte the key compiled into the binary
+# (release-key.pub). It is public: it proves the checksum file was signed by the
+# project, and it is useless without the private key nobody ships.
+RELEASE_PUBLIC_KEY='untrusted comment: base release signing key
+UNSET'
+
+# ── download, verify, unpack, hand off ───────────────────────────────────────
 tmp=$(mktemp -d 2>/dev/null || mktemp -d -t base-install)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
@@ -74,6 +81,35 @@ fetch "$url" "$tmp/$asset" || die "download failed: $url"
 # A GitHub 404 page is served as HTML with a 200 on some proxies; a truncated
 # or wrong-content download would otherwise reach `tar` as a confusing error.
 tar tzf "$tmp/$asset" >/dev/null 2>&1 || die "downloaded file is not a valid archive — check that $label exists"
+
+# The binary verifies its own updates, but this first copy arrives before any of
+# that code is running. Check it here too, and refuse rather than install
+# something that does not match the signed checksum file.
+say "base: verifying $asset"
+fetch "$base_url/SHA256SUMS" "$tmp/SHA256SUMS" \
+  || die "could not download SHA256SUMS — refusing to install a download that cannot be verified"
+
+expected=$(awk -v a="$asset" '$2 == a { print $1 }' "$tmp/SHA256SUMS")
+[ -n "$expected" ] || die "SHA256SUMS has no entry for $asset — refusing to install"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "$tmp/$asset" | cut -d' ' -f1)
+else
+  actual=$(shasum -a 256 "$tmp/$asset" | cut -d' ' -f1)
+fi
+[ "$actual" = "$expected" ] \
+  || die "checksum mismatch for $asset — the download is damaged or was tampered with; nothing was installed"
+
+if command -v minisign >/dev/null 2>&1; then
+  fetch "$base_url/SHA256SUMS.minisig" "$tmp/SHA256SUMS.minisig" \
+    || die "could not download SHA256SUMS.minisig — refusing to install"
+  printf '%s\n' "$RELEASE_PUBLIC_KEY" > "$tmp/release-key.pub"
+  minisign -V -m "$tmp/SHA256SUMS" -x "$tmp/SHA256SUMS.minisig" -p "$tmp/release-key.pub" >/dev/null 2>&1 \
+    || die "the SHA256SUMS signature did not verify — refusing to install"
+  say "base: signature verified"
+else
+  say "base: checksum verified (install minisign to also check the release signature)"
+fi
 
 tar xzf "$tmp/$asset" -C "$tmp"
 [ -x "$tmp/base" ] || chmod +x "$tmp/base" 2>/dev/null || true

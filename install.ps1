@@ -33,12 +33,13 @@
         $asset = 'base-windows-x86_64.zip'
 
         if ($env:BASE_VERSION) {
-            $url   = "https://github.com/$repo/releases/download/$($env:BASE_VERSION)/$asset"
+            $base  = "https://github.com/$repo/releases/download/$($env:BASE_VERSION)"
             $label = $env:BASE_VERSION
         } else {
-            $url   = "https://github.com/$repo/releases/latest/download/$asset"
+            $base  = "https://github.com/$repo/releases/latest/download"
             $label = 'latest'
         }
+        $url = "$base/$asset"
 
         # BASE_HOME is base's own override and the only one that isolates on
         # Windows: src/home.rs notes that `dirs` never consults $HOME here, so a
@@ -68,6 +69,33 @@
             } catch {
                 Die "download failed: $url"
             }
+
+            # The binary verifies its own updates, but this first copy arrives
+            # before any of that code is running. Check it here too: a release
+            # publishes SHA256SUMS, and a download that does not match it is not
+            # installed. (The minisign signature over SHA256SUMS is checked by
+            # the binary on every later update; PowerShell cannot verify it.)
+            Say "base: verifying $asset"
+            $sumsPath = Join-Path $tmp 'SHA256SUMS'
+            try {
+                $prev = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+                Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile $sumsPath -UseBasicParsing
+                $ProgressPreference = $prev
+            } catch {
+                Die "could not download SHA256SUMS - refusing to install a download that cannot be verified"
+            }
+
+            $line = Get-Content $sumsPath |
+                Where-Object { ($_ -split '\s+')[1] -eq $asset } |
+                Select-Object -First 1
+            if (-not $line) { Die "SHA256SUMS has no entry for $asset - refusing to install" }
+
+            $expected = ($line -split '\s+')[0]
+            $actual   = (Get-FileHash $zip -Algorithm SHA256).Hash
+            if ($actual -ne $expected) {
+                Die "checksum mismatch for $asset - the download is damaged or was tampered with; nothing was installed"
+            }
+            Say 'base: checksum verified'
 
             try {
                 Expand-Archive -Path $zip -DestinationPath $tmp -Force

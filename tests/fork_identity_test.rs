@@ -49,3 +49,24 @@ fn no_installer_points_at_upstream() {
         );
     }
 }
+
+/// `install.sh` verifies the release signature with a copy of the public key,
+/// and the binary verifies it with `release-key.pub`. Two copies of one key is
+/// one copy too many unless something holds them together: a shell script and a
+/// Rust constant cannot see each other, and a stale installer key rejects every
+/// release the binary accepts (or, worse, trusts a key the binary does not).
+#[test]
+fn the_installer_trusts_the_same_key_as_the_binary() {
+    let key_file = read("release-key.pub");
+    let key_line = key_file
+        .lines()
+        .nth(1)
+        .expect("release-key.pub has a key line")
+        .trim();
+    assert!(!key_line.is_empty(), "release-key.pub has an empty key line");
+    assert!(
+        read("install.sh").contains(key_line),
+        "install.sh does not carry the key line from release-key.pub, so it would \
+         reject (or wrongly accept) release signatures"
+    );
+}
