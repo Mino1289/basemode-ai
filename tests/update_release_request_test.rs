@@ -100,12 +100,17 @@ impl Drop for TokenEnv {
     }
 }
 
-/// A releases-API answer the real parser can read: a tag, and an asset named for
-/// whatever platform this test is running on.
+/// A releases-API answer the real parser can read: a tag, this platform's
+/// asset, and the signed checksum file the updater now requires before it will
+/// download anything.
 fn ok_release_response() -> ureq::Response {
     let asset = asset_name().expect("this platform has a published asset name");
     let body = format!(
-        r#"{{"tag_name":"v9.9.9","assets":[{{"name":"{asset}","browser_download_url":"https://example.invalid/{asset}"}}]}}"#
+        r#"{{"tag_name":"v9.9.9","assets":[
+            {{"name":"{asset}","browser_download_url":"https://example.invalid/{asset}"}},
+            {{"name":"SHA256SUMS","browser_download_url":"https://example.invalid/SHA256SUMS"}},
+            {{"name":"SHA256SUMS.minisig","browser_download_url":"https://example.invalid/SHA256SUMS.minisig"}}
+        ]}}"#
     );
     format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{body}")
         .parse()
@@ -150,7 +155,9 @@ fn transport_failure() -> Box<ureq::Error> {
 
 /// Drive the product and collect the `authorization` header off every request it
 /// actually built, in order.
-fn auth_headers_seen<F>(answer: F) -> (Vec<Option<String>>, anyhow::Result<(String, String)>)
+fn auth_headers_seen<F>(
+    answer: F,
+) -> (Vec<Option<String>>, anyhow::Result<base::update::Release>)
 where
     F: Fn(usize) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
 {
@@ -206,7 +213,7 @@ fn token_in_the_environment_reaches_the_request_the_updater_builds() {
         Some("application/vnd.github+json"),
         "accept was lost"
     );
-    assert_eq!(out.expect("canned 200 parses into a release").0, "9.9.9");
+    assert_eq!(out.expect("canned 200 parses into a release").tag, "9.9.9");
 }
 
 #[test]

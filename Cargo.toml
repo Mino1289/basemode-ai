@@ -22,6 +22,11 @@ include_dir = "0.7"
 open = "5"
 ureq = { version = "2", features = ["json"] }
 sha2 = "0.11.0"
+# Release verification: minisign signature over SHA256SUMS, checked in
+# src/update/verify.rs before any archive is unpacked. Verify-only by design —
+# the private key never exists in this tree or on a release runner that does not
+# have it as a secret.
+minisign-verify = "0.3"
 rpassword = "7"
 pdf-extract = "0.10.0"
 

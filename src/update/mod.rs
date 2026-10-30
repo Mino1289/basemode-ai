@@ -21,14 +21,25 @@
 //! Nothing is read that the operator did not already put in their own
 //! environment, and the token can only ever reach `api.github.com`: the address
 //! below is a hardcoded constant, with no setting and no environment variable
-//! that can point this request anywhere else. That is deliberate. There is no
-//! signature check and no checksum check in the download path, so the constant
-//! is the only thing vouching for what gets installed, and making it overridable
-//! would turn a redirected update into arbitrary code execution.
+//! that can point this request anywhere else.
+//!
+//! What gets installed is no longer taken on faith from that URL. Every release
+//! publishes `SHA256SUMS` and a minisign signature over it; the public key is
+//! compiled in (`release-key.pub`, see `verify`), the signature is checked
+//! before anything is unpacked, and the archive is checked against the digest it
+//! names. A release that cannot be verified is refused, not installed with a
+//! warning.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+
+mod verify;
+
+/// Whether this build carries a usable release key. Exposed so `base doctor`
+/// can say "this build cannot verify updates" instead of leaving an operator to
+/// discover it when an update silently refuses to install.
+pub use verify::embedded_key_is_set;
 
 /// Public releases API — the same artifacts the release workflow publishes.
 const LATEST_RELEASE_API: &str =
@@ -124,8 +135,42 @@ fn describe_release_api_error(err: Box<ureq::Error>) -> anyhow::Error {
     }
 }
 
-/// The latest release: its tag (leading `v` stripped) and the download URL for
-/// this platform's asset.
+/// The checksum file every release carries, and the signature over it. Names
+/// are part of the contract with `.github/workflows/release.yml`.
+const SUMS_ASSET: &str = "SHA256SUMS";
+const SUMS_SIG_ASSET: &str = "SHA256SUMS.minisig";
+
+/// Everything one release offers that the updater needs.
+///
+/// The signature URLs are part of this struct rather than fetched lazily so
+/// that a release without them fails at the metadata step, before a single byte
+/// of binary is downloaded.
+#[derive(Debug)]
+pub struct Release {
+    /// Release tag, leading `v` stripped.
+    pub tag: String,
+    /// This platform's archive.
+    pub asset_url: String,
+    /// `SHA256SUMS`, signed by `SHA256SUMS.minisig`.
+    pub sums_url: String,
+    pub sums_sig_url: String,
+}
+
+/// The `browser_download_url` of one named asset.
+fn download_url_for(json: &serde_json::Value, name: &str) -> Option<String> {
+    json.get("assets")
+        .and_then(|a| a.as_array())
+        .and_then(|assets| {
+            assets
+                .iter()
+                .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(name))
+        })
+        .and_then(|a| a.get("browser_download_url"))
+        .and_then(|u| u.as_str())
+        .map(str::to_string)
+}
+
+/// The latest release: its tag and the three downloads the updater needs.
 ///
 /// `send` is the transport, supplied by the caller. Production passes a closure
 /// that calls the request. A test passes one that reads the request and answers
@@ -136,7 +181,7 @@ fn describe_release_api_error(err: Box<ureq::Error>) -> anyhow::Error {
 /// is nowhere else for this module to build a release request, so no later edit
 /// can quietly route around the header wiring below, and the request a test
 /// inspects is the same object production sends.
-pub fn fetch_latest_release<F>(send: F) -> Result<(String, String)>
+pub fn fetch_latest_release<F>(send: F) -> Result<Release>
 where
     F: Fn(ureq::Request) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
 {
@@ -161,32 +206,61 @@ where
         .to_string();
 
     let wanted = asset_name()?;
-    let url = json
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .and_then(|assets| {
-            assets.iter().find(|a| {
-                a.get("name").and_then(|n| n.as_str()) == Some(wanted)
-            })
-        })
-        .and_then(|a| a.get("browser_download_url"))
-        .and_then(|u| u.as_str())
-        .with_context(|| format!("release v{tag} has no asset named '{wanted}'"))?
-        .to_string();
+    let asset_url = download_url_for(&json, wanted)
+        .with_context(|| format!("release v{tag} has no asset named '{wanted}'"))?;
 
-    Ok((tag, url))
+    // Fail here, not after a 40 MB download: a release without a signed
+    // checksum file is a release this updater will refuse anyway.
+    let missing = |what: &str| {
+        anyhow!(
+            "release v{tag} publishes no {what}, so it cannot be verified. Refusing to \
+             install it. Releases from this fork are signed; see docs/releasing.md."
+        )
+    };
+    let sums_url = download_url_for(&json, SUMS_ASSET).ok_or_else(|| missing(SUMS_ASSET))?;
+    let sums_sig_url = download_url_for(&json, SUMS_SIG_ASSET).ok_or_else(|| missing(SUMS_SIG_ASSET))?;
+
+    Ok(Release { tag, asset_url, sums_url, sums_sig_url })
 }
 
-/// Stream a release asset to disk.
-fn download_asset(url: &str, dir: &Path) -> Result<PathBuf> {
+/// Largest `SHA256SUMS` / `.minisig` this will read. The real ones are under a
+/// kilobyte; the cap is only here so a hostile endpoint cannot stream forever.
+const MAX_METADATA_BYTES: u64 = 1024 * 1024;
+
+/// Download one of the small verification files into memory.
+fn download_small<F>(url: &str, what: &str, send: &F) -> Result<Vec<u8>>
+where
+    F: Fn(ureq::Request) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+{
+    use std::io::Read;
+
+    let req = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(API_TIMEOUT_SECS))
+        .set("user-agent", USER_AGENT);
+    let resp = send(req).with_context(|| format!("downloading {what}"))?;
+    let mut reader = std::io::Read::take(resp.into_reader(), MAX_METADATA_BYTES);
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .with_context(|| format!("reading {what}"))?;
+    if buf.is_empty() {
+        bail!("{what} was empty");
+    }
+    Ok(buf)
+}
+
+/// Download a release asset to disk.
+fn download_asset<F>(url: &str, dir: &Path, send: &F) -> Result<PathBuf>
+where
+    F: Fn(ureq::Request) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+{
     let filename = asset_name()?;
     let dest = dir.join(filename);
 
-    let resp = ureq::get(url)
+    let req = ureq::get(url)
         .timeout(std::time::Duration::from_secs(PAYLOAD_TIMEOUT_SECS))
-        .set("user-agent", USER_AGENT)
-        .call()
-        .with_context(|| format!("downloading {url}"))?;
+        .set("user-agent", USER_AGENT);
+    let resp = send(req).with_context(|| format!("downloading {url}"))?;
 
     // into_reader() yields a boxed trait object; Read::take needs a sized value.
     let mut reader = std::io::Read::take(resp.into_reader(), MAX_PAYLOAD_BYTES);
@@ -197,6 +271,60 @@ fn download_asset(url: &str, dir: &Path) -> Result<PathBuf> {
         bail!("downloaded asset was empty");
     }
     Ok(dest)
+}
+
+/// Download this platform's archive and prove it is the one the release key
+/// signed, before anything unpacks it.
+///
+/// Order matters. The signature is checked first, so the checksum file itself is
+/// authenticated before any line of it is believed; only then is the archive
+/// fetched and hashed. A tampered checksum file therefore costs the operator one
+/// small download, never a large one.
+pub fn fetch_verified_archive<F>(release: &Release, dir: &Path, send: F) -> Result<PathBuf>
+where
+    F: Fn(ureq::Request) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+{
+    verified_archive(release, dir, send, verify::embedded_key())
+}
+
+/// `fetch_verified_archive` against an explicit key.
+///
+/// Only compiled for test builds, via the `isolation-guard` feature the
+/// dev-dependency turns on. The tests have to exercise the real ordering and
+/// the real checksum check without the release private key, and the alternative
+/// — committing a key that production trusts — would be far worse than a
+/// test-only seam.
+#[cfg(feature = "isolation-guard")]
+pub fn fetch_verified_archive_with_key<F>(
+    release: &Release,
+    dir: &Path,
+    send: F,
+    key_text: &str,
+) -> Result<PathBuf>
+where
+    F: Fn(ureq::Request) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+{
+    verified_archive(release, dir, send, key_text)
+}
+
+fn verified_archive<F>(
+    release: &Release,
+    dir: &Path,
+    send: F,
+    key_text: &str,
+) -> Result<PathBuf>
+where
+    F: Fn(ureq::Request) -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+{
+    let sums = download_small(&release.sums_url, SUMS_ASSET, &send)?;
+    let sig = download_small(&release.sums_sig_url, SUMS_SIG_ASSET, &send)?;
+    let sig = String::from_utf8(sig).context("SHA256SUMS.minisig is not UTF-8")?;
+    verify::verify_sums(key_text, &sums, &sig)?;
+
+    let sums = String::from_utf8(sums).context("SHA256SUMS is not UTF-8")?;
+    let archive = download_asset(&release.asset_url, dir, &send)?;
+    verify::verify_archive(&archive, &sums, asset_name()?)?;
+    Ok(archive)
 }
 
 /// Extract an archive with system `tar` and locate the `base` executable inside
@@ -584,14 +712,15 @@ fn auto_install_dest() -> Result<PathBuf> {
 /// The background path: no output, no ceremony, just get current.
 fn run_quiet(force: bool) -> Result<Option<String>> {
     let current = env!("CARGO_PKG_VERSION");
-    let (latest, url) = fetch_latest_release(|req| req.call().map_err(Box::new))?;
-    if !force && is_current(current, &latest) {
+    let release = fetch_latest_release(|req| req.call().map_err(Box::new))?;
+    if !force && is_current(current, &release.tag) {
         return Ok(None);
     }
+    let latest = &release.tag;
     let work = std::env::temp_dir().join(format!("base-update-{}", std::process::id()));
     std::fs::create_dir_all(&work)?;
     let outcome = (|| -> Result<Option<String>> {
-        let archive = download_asset(&url, &work)?;
+        let archive = fetch_verified_archive(&release, &work, |req| req.call().map_err(Box::new))?;
         let new_bin = extract_and_locate(&archive, &work.join("x"))?;
         let new_ver = binary_version(&new_bin).unwrap_or_default();
         if !force && !new_ver.is_empty() && is_current(current, &new_ver) {
@@ -613,9 +742,10 @@ fn run_verbose(check_only: bool, force: bool) -> Result<Option<String>> {
     let current = env!("CARGO_PKG_VERSION");
     println!("base {current} — checking GitHub releases …");
 
-    let (latest, url) = fetch_latest_release(|req| req.call().map_err(Box::new))?;
+    let release = fetch_latest_release(|req| req.call().map_err(Box::new))?;
+    let latest = &release.tag;
 
-    if !force && is_current(current, &latest) {
+    if !force && is_current(current, latest) {
         println!("✓ already up to date (base {current}).");
         return Ok(None);
     }
@@ -628,7 +758,8 @@ fn run_verbose(check_only: bool, force: bool) -> Result<Option<String>> {
     let work = std::env::temp_dir().join(format!("base-update-{}", std::process::id()));
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     let outcome = (|| -> Result<Option<String>> {
-        let archive = download_asset(&url, &work)?;
+        let archive = fetch_verified_archive(&release, &work, |req| req.call().map_err(Box::new))?;
+        println!("✓ signature and checksum verified");
         let new_bin = extract_and_locate(&archive, &work.join("x"))?;
 
         // Authoritative version guard against the extracted binary — the tag is
