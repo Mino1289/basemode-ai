@@ -30,6 +30,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: base-help coach matches this binary
         run: cargo test --bin base help_docs
+      # `base update` verifies a release against the key compiled into the
+      # binary. A tag cut while that key is still the keygen placeholder ships
+      # binaries that cannot verify anything, and an update that cannot verify
+      # is refused — so the release would reach nobody. Fail here instead, where
+      # the message says what to run.
+      - name: release-key.pub is a real key
+        run: |
+          if grep -q '^UNSET' release-key.pub; then
+            echo "::error::release-key.pub is still the keygen placeholder. Run scripts/release-sign.sh keygen, commit release-key.pub, and set MINISIGN_SECRET_KEY before tagging."
+            exit 1
+          fi
 
   build:
     needs: docs-gate
@@ -110,11 +121,24 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      signed: ${{ steps.sign.outputs.signed }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
+
+      # `download-artifact` leaves each archive inside a directory named after
+      # it. Flatten into one directory so the checksum file, the signature and
+      # the release upload all name the same paths.
+      - name: Collect assets
+        run: |
+          mkdir -p dist
+          for a in base-linux-x86_64.tar.gz base-windows-x86_64.zip \
+                   base-darwin-aarch64.tar.gz base-darwin-x86_64.tar.gz; do
+            cp "$a/$a" "dist/$a"
+          done
 
       # Every release body but three was this install template and nothing else,
       # so the tag was the only record of what changed. CHANGELOG.md now carries
@@ -126,6 +150,15 @@ jobs:
           cat >> release-notes.md <<'FOOTER'
 
           ---
+          ## Verify
+
+          `SHA256SUMS` is signed with the release key in `release-key.pub`:
+
+          ```bash
+          minisign -V -m SHA256SUMS -x SHA256SUMS.minisig -p release-key.pub
+          sha256sum -c SHA256SUMS
+          ```
+
           ## Install
 
           ```bash
@@ -137,22 +170,60 @@ jobs:
           Docs: https://docs.basemode.ai
           FOOTER
 
+      # Without a signature the release is a DRAFT, not a published one:
+      # /releases/latest ignores drafts, so no installed base can ever be handed
+      # a binary it would refuse to install. The alternative — publishing
+      # unsigned and hoping — is the hole this whole phase exists to close.
+      - name: Checksums and signature
+        id: sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          cd dist
+          sha256sum base-* > SHA256SUMS
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::MINISIGN_SECRET_KEY is not set, so this release is a DRAFT and cannot be installed. Sign it and publish: scripts/release-sign.sh sign <dir>, then upload SHA256SUMS and SHA256SUMS.minisig."
+            exit 0
+          fi
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          chmod 600 "$key"
+
+          # Prove the secret is the pair of the key the binary trusts. A
+          # mismatch publishes releases that every installed base refuses, and
+          # nothing else in this job would notice.
+          printf 'release key probe\n' > "$RUNNER_TEMP/probe"
+          minisign -S -s "$key" -m "$RUNNER_TEMP/probe" -x "$RUNNER_TEMP/probe.minisig"
+          minisign -V -m "$RUNNER_TEMP/probe" -x "$RUNNER_TEMP/probe.minisig" \
+            -p "$GITHUB_WORKSPACE/release-key.pub" >/dev/null
+
+          minisign -S -s "$key" -m SHA256SUMS -x SHA256SUMS.minisig
+          rm -f "$key" "$RUNNER_TEMP/probe" "$RUNNER_TEMP/probe.minisig"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            base-linux-x86_64.tar.gz/base-linux-x86_64.tar.gz
-            base-windows-x86_64.zip/base-windows-x86_64.zip
-            base-darwin-aarch64.tar.gz/base-darwin-aarch64.tar.gz
-            base-darwin-x86_64.tar.gz/base-darwin-x86_64.tar.gz
+          draft: ${{ steps.sign.outputs.signed != 'true' }}
+          fail_on_unmatched_files: true
+          files: dist/*
           body_path: release-notes.md
 
   # Tell the docs site a release happened. It fetches the coach's reference files
   # and this changelog at the tag and opens its own pull request; nothing is
   # pushed from here. Skipped rather than failed when the token is absent, so a
   # release never fails on the docs half.
+  #
+  # A draft release is not a release: it is not installable, so the docs site
+  # must not describe it as current.
   notify-docs:
     needs: release
+    if: needs.release.outputs.signed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
