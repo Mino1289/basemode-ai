@@ -28,6 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod antigravity;
 pub mod claude;
 pub mod copilot;
 pub mod cursor;
@@ -40,11 +41,17 @@ pub enum Harness {
     OpenCode,
     Cursor,
     Copilot,
+    Antigravity,
 }
 
 impl Harness {
-    pub const ALL: [Harness; 4] =
-        [Harness::Claude, Harness::OpenCode, Harness::Cursor, Harness::Copilot];
+    pub const ALL: [Harness; 5] = [
+        Harness::Claude,
+        Harness::OpenCode,
+        Harness::Cursor,
+        Harness::Copilot,
+        Harness::Antigravity,
+    ];
 
     /// The names `--harness` accepts. `claude-code` is the spelling the docs use;
     /// `claude` is what the rest of this tree calls it.
@@ -54,6 +61,9 @@ impl Harness {
             "opencode" | "open-code" => Some(Harness::OpenCode),
             "cursor" => Some(Harness::Cursor),
             "copilot" | "github-copilot" | "copilot-cli" => Some(Harness::Copilot),
+            "antigravity" | "antigravity-cli" | "gemini" | "gemini-cli" | "agy" => {
+                Some(Harness::Antigravity)
+            }
             _ => None,
         }
     }
@@ -64,6 +74,7 @@ impl Harness {
             Harness::OpenCode => "opencode",
             Harness::Cursor => "cursor",
             Harness::Copilot => "copilot",
+            Harness::Antigravity => "antigravity",
         }
     }
 }
@@ -118,6 +129,14 @@ pub fn canonical_event(harness: Harness, raw: &str) -> Option<&'static str> {
             "sessionEnd" => "session-end",
             _ => return None,
         },
+        Harness::Antigravity => match name {
+            "SessionStart" => "session-start",
+            "PreInvocation" => "user-prompt-submit",
+            "PreToolUse" => "pre-tool-use",
+            "PostToolUse" => "post-tool-use",
+            "Stop" => "stop",
+            _ => return None,
+        },
         // The OpenCode plugin speaks canonical names; it is code we ship, not a
         // payload we have to guess at.
         Harness::OpenCode => return None,
@@ -132,6 +151,7 @@ pub fn inbound(harness: Harness, event: &str, raw: serde_json::Value) -> serde_j
         Harness::OpenCode => opencode::inbound(raw),
         Harness::Cursor => cursor::inbound(event, raw),
         Harness::Copilot => copilot::inbound(event, raw),
+        Harness::Antigravity => antigravity::inbound(event, raw),
     }
 }
 
@@ -148,6 +168,7 @@ pub fn outbound(harness: Harness, event: &str, text: &str) -> Option<String> {
         Harness::OpenCode => opencode::outbound(event, text),
         Harness::Cursor => cursor::outbound(event, text),
         Harness::Copilot => copilot::outbound(event, text),
+        Harness::Antigravity => antigravity::outbound(event, text),
     }
 }
 
@@ -223,8 +244,13 @@ pub trait Binding: Sync {
 
 /// Every adapter, in the order `base install` reports them.
 pub fn registry() -> &'static [&'static dyn Binding] {
-    static REGISTRY: [&'static dyn Binding; 4] =
-        [&claude::BINDING, &opencode::BINDING, &cursor::BINDING, &copilot::BINDING];
+    static REGISTRY: [&'static dyn Binding; 5] = [
+        &claude::BINDING,
+        &opencode::BINDING,
+        &cursor::BINDING,
+        &copilot::BINDING,
+        &antigravity::BINDING,
+    ];
     &REGISTRY
 }
 
@@ -314,6 +340,8 @@ mod tests {
         assert_eq!(canonical_event(Harness::Copilot, "userPromptSubmitted"), Some("user-prompt-submit"));
         assert_eq!(canonical_event(Harness::Copilot, "agentStop"), Some("stop"));
         assert_eq!(canonical_event(Harness::Cursor, "sessionStart"), Some("session-start"));
+        assert_eq!(canonical_event(Harness::Antigravity, "PreInvocation"), Some("user-prompt-submit"));
+        assert_eq!(canonical_event(Harness::Antigravity, "SessionStart"), Some("session-start"));
         assert_eq!(canonical_event(Harness::Cursor, "noSuchEvent"), None);
     }
 

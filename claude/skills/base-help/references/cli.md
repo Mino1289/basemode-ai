@@ -271,7 +271,7 @@ Arguments:
 
 Options:
       --harness <HARNESS>
-          The host that called this hook: claude (default), opencode, cursor, copilot
+          The host that called this hook: claude (default), opencode, cursor, copilot, antigravity
 
   -h, --help
           Print help
@@ -3100,7 +3100,7 @@ Options:
           Skip hook wiring in settings.json
 
       --harness <HARNESS>
-          Wire only this host: claude, opencode, cursor, copilot, or all (default: every host detected)
+          Wire only this host: claude, opencode, cursor, copilot, antigravity, or all (default: every host detected)
 
       --full
           Register the bundled components (PAUL, SEED, SKILLSMITH) in manifest
@@ -3211,7 +3211,7 @@ Options:
           Also remove ~/.base-gbl/ global tier (destructive)
 
       --harness <HARNESS>
-          Un-wire only this host: claude, opencode, cursor, copilot, or all (default: every host)
+          Un-wire only this host: claude, opencode, cursor, copilot, antigravity, or all (default: every host)
 
   -h, --help
           Print help

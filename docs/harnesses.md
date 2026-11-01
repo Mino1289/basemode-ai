@@ -25,20 +25,20 @@ adapter layer, not four products.
 
 ## Capability matrix
 
-| Capability | Claude Code | OpenCode 2.x | Cursor | Copilot CLI |
-|---|---|---|---|---|
-| Session start | `SessionStart` hook | `ctx.event.subscribe` → `session.created` | `sessionStart` | `sessionStart` |
-| Prompt submit | `UserPromptSubmit` | `ctx.session.hook("prompt")` | `beforeSubmitPrompt` | `userPromptSubmitted` |
-| Pre tool | `PreToolUse` + matcher | `ctx.tool.hook("execute.before")` | `preToolUse` | `preToolUse` |
-| Post tool | `PostToolUse` | `ctx.tool.hook("execute.after")` | `postToolUse` | `postToolUse` |
-| Stop | `Stop` | `session.idle` | `stop` | `agentStop` |
-| Session end | `SessionEnd` | `session.deleted` | `sessionEnd` | `sessionEnd` |
-| Context injection | stdout `hookSpecificOutput.additionalContext` | mutate `event.prompt.text`, push `event.system` | `additional_context` / `agent_message` | `{"additionalContext": "..."}` |
-| Blocking | exit 2 / `permissionDecision` | throw in `execute.before` | exit 2 / `permission: deny` | exit 2 / `permissionDecision` |
-| Config file | `~/.claude/settings.json` | `~/.config/opencode/plugins/base.ts` | `~/.cursor/hooks.json` | `~/.copilot/hooks/base.json` |
-| Project scope | `.claude/settings.json` | `.opencode/plugins/` | `.cursor/hooks.json` | `.github/hooks/*.json` |
-| Custom tools | MCP / skills | `ctx.tool.transform` | MCP | MCP |
-| Skills | `~/.claude/skills` | `ctx.skill.transform` | third-party import | not yet |
+| Capability | Claude Code | OpenCode 2.x | Cursor | Copilot CLI | Antigravity CLI |
+|---|---|---|---|---|---|
+| Session start | `SessionStart` hook | `ctx.event.subscribe` → `session.created` | `sessionStart` | `sessionStart` | `SessionStart` |
+| Prompt submit | `UserPromptSubmit` | `ctx.session.hook("prompt")` | `beforeSubmitPrompt` | `userPromptSubmitted` | `PreInvocation` |
+| Pre tool | `PreToolUse` + matcher | `ctx.tool.hook("execute.before")` | `preToolUse` | `preToolUse` | `PreToolUse` |
+| Post tool | `PostToolUse` | `ctx.tool.hook("execute.after")` | `postToolUse` | `postToolUse` | `PostToolUse` |
+| Stop | `Stop` | `session.idle` | `stop` | `agentStop` | `Stop` |
+| Session end | `SessionEnd` | `session.deleted` | `sessionEnd` | `sessionEnd` | `Stop` |
+| Context injection | stdout `hookSpecificOutput.additionalContext` | mutate `event.prompt.text`, push `event.system` | `additional_context` / `agent_message` | `{"additionalContext": "..."}` | `injectSteps: [systemMessage/ephemeralMessage]` |
+| Blocking | exit 2 / `permissionDecision` | throw in `execute.before` | exit 2 / `permission: deny` | exit 2 / `permissionDecision` | `decision: deny` |
+| Config file | `~/.claude/settings.json` | `~/.config/opencode/plugins/base.ts` | `~/.cursor/hooks.json` | `~/.copilot/hooks/base.json` | `~/.gemini/config/plugins/base/hooks.json` |
+| Project scope | `.claude/settings.json` | `.opencode/plugins/` | `.cursor/hooks.json` | `.github/hooks/*.json` | `.agents/hooks.json` |
+| Custom tools | MCP / skills | `ctx.tool.transform` | MCP | MCP | MCP / skills |
+| Skills | `~/.claude/skills` | `ctx.skill.transform` | third-party import | not yet | `~/.gemini/skills` |
 
 ## Per-harness detail
 
@@ -121,6 +121,24 @@ Known upstream bugs to design around (all open as of 2026-10): `sessionStart`
 prompt rather than once per session (#2491), `preToolUse` ignores
 `updatedInput` (#2013). So: treat Copilot as injection-only, never as a
 guarantee, and make every hook fail-open.
+
+### Antigravity CLI (native plugin)
+
+Antigravity CLI (`agy`) discovers customizations from `~/.gemini/config/` and
+workspace `.agents/`. Hooks live in plugins (`~/.gemini/config/plugins/base/`):
+- `plugin.json`: manifest declaring the plugin name and description.
+- `hooks.json`: declares hooks for `SessionStart`, `PreInvocation` (prompt),
+  `PreToolUse`, `PostToolUse`, and `Stop`.
+
+Antigravity expects protojson responses:
+- `SessionStart`: `{"injectSteps": [{"systemMessage": {"systemMessage": "..."}}]}`
+- `PreInvocation`: `{"injectSteps": [{"ephemeralMessage": "..."}]}`
+- `PreToolUse`: `{"decision": "allow"}`
+- `PostToolUse` / `Stop`: `{}`
+
+Tool names map cleanly: `run_command` -> `Bash`, `read_file` -> `Read`,
+`edit_file` -> `Edit`, `write_file` -> `Write`. Argument keys `CommandLine` and
+`Path` normalize to `command` and `file_path`.
 
 ## The part nobody mentions: the LLM backend
 

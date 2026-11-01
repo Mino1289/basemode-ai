@@ -247,7 +247,10 @@ fn inbound_maps_the_copilot_field_names_and_keeps_the_rest() {
 
     let got = inbound("pre-tool-use", raw);
     assert_eq!(got["session_id"], "session-1");
-    assert_eq!(got["tool_name"], "bash");
+    assert_eq!(
+        got["tool_name"], "Bash",
+        "the engine's matchers compare against Claude's tool names literally"
+    );
     assert_eq!(got["tool_input"]["command"], "ls -la");
     assert_eq!(
         got["cwd"], "/work/tree",

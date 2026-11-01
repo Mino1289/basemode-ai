@@ -76,7 +76,7 @@ pub enum Commands {
     Hook {
         /// Hook event type
         event: String,
-        /// The host that called this hook: claude (default), opencode, cursor, copilot
+        /// The host that called this hook: claude (default), opencode, cursor, copilot, antigravity
         #[arg(long)]
         harness: Option<String>,
     },
@@ -321,7 +321,7 @@ pub enum Commands {
         /// Skip hook wiring in settings.json
         #[arg(long)]
         skip_hooks: bool,
-        /// Wire only this host: claude, opencode, cursor, copilot, or all (default: every host detected)
+        /// Wire only this host: claude, opencode, cursor, copilot, antigravity, or all (default: every host detected)
         #[arg(long)]
         harness: Option<String>,
         /// Register the bundled components (PAUL, SEED, SKILLSMITH) in manifest
@@ -365,7 +365,7 @@ pub enum Commands {
         /// Also remove ~/.base-gbl/ global tier (destructive)
         #[arg(long)]
         purge: bool,
-        /// Un-wire only this host: claude, opencode, cursor, copilot, or all (default: every host)
+        /// Un-wire only this host: claude, opencode, cursor, copilot, antigravity, or all (default: every host)
         #[arg(long)]
         harness: Option<String>,
     },

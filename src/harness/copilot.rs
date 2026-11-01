@@ -17,6 +17,15 @@
 //! `postToolUse`, `errorOccurred`, `agentStop`. Injection is a single line,
 //! `{"additionalContext": "..."}`, on stdout.
 //!
+//! Copilot's payload is not Claude's: a `preToolUse` hook receives
+//! `sessionId`, `toolName` and `toolArgs`, and `toolArgs` is documented as a
+//! JSON **string**. [`inbound`] copies those onto the keys the engine reads and
+//! leaves the host's own keys in place, so a payload that already carries the
+//! engine's names (`session_id`, `tool_input`) passes through unchanged. This
+//! coalescing is deliberately one-directional: base never removes a field a host
+//! sent, because the engine's readers are all `.get` lookups that ignore what
+//! they do not know.
+//!
 //! Known upstream bugs to design around (all open as of 2026-10):
 //!
 //! - `sessionStart` `additionalContext` is ignored on some versions (#2142).
@@ -27,17 +36,20 @@
 //! having run, the engine must tolerate `session-start` arriving many times,
 //! and every hook fails open.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::{Map, Value};
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
 
 use super::{Binding, Harness, WireOutcome};
 
-/// The six events base wires, host name first and canonical name second.
+/// One entry per canonical event, keyed by Copilot's own event name.
 ///
-/// `errorOccurred` is deliberately absent: base has no arm for it, and a hook
-/// that cannot do anything is a process spawn per error for nothing.
-const HOOK_EVENTS: [(&str, &str); 6] = [
+/// The config is written with camelCase names, so Copilot sends the camelCase
+/// payload and [`inbound`] does the translating. The command still passes the
+/// canonical event name, which is what the engine dispatches on.
+const WIRED: [(&str, &str); 6] = [
     ("sessionStart", "session-start"),
     ("userPromptSubmitted", "user-prompt-submit"),
     ("preToolUse", "pre-tool-use"),
@@ -46,55 +58,93 @@ const HOOK_EVENTS: [(&str, &str); 6] = [
     ("sessionEnd", "session-end"),
 ];
 
-/// Copilot kills a hook that outlives this. Ten seconds is the value its own
-/// examples use, and base's slowest hook (a cold graph parse) stays under it.
-const TIMEOUT_SECS: u64 = 10;
+/// Long enough for a cold hook on a large graph, short enough that a wedged
+/// hook cannot stall the agent. Copilot's default is 30 seconds; base's hooks
+/// are budgeted to return in well under this.
+const TIMEOUT_SEC: u64 = 10;
 
-/// The fields a Copilot hook entry can carry its command in.
-const COMMAND_KEYS: [&str; 3] = ["bash", "powershell", "command"];
+/// The substring every command base writes contains, and the marker un-wiring
+/// looks for. Deliberately the same spelling `base uninstall` uses for Claude
+/// Code's entries.
+const BASE_COMMAND: &str = "base hook";
 
 /// Copilot's payload in the engine's shape.
 ///
-/// Copilot spells three fields differently from Claude Code; everything else it
-/// sends (`cwd`, `timestamp`, `prompt`, a tool's own arguments) is already where
-/// the engine looks, so it is copied through untouched. The original keys stay
-/// too: a hook cannot know which payload shape a future Copilot will still send,
-/// and dropping one would lose information for nothing.
-pub fn inbound(_event: &str, raw: serde_json::Value) -> serde_json::Value {
-    let Value::Object(mut object) = raw else {
+/// Three coalesces, and nothing else: `sessionId` → `session_id`, `toolName` →
+/// `tool_name` (runtime names normalized to the Claude names the matchers read
+/// literally — `pre_tool_use.rs` compares against `"Bash"`, `"Edit"`,
+/// `"PowerShell"`), `toolArgs` → `tool_input` (parsed when it is the JSON string
+/// Copilot documents, passed through otherwise). Every other field survives
+/// untouched, and the host's own keys are kept rather than moved: the engine
+/// only ever reads, so a payload arriving in Claude's dialect is already right
+/// and an unknown field costs nothing.
+pub fn inbound(_event: &str, raw: Value) -> Value {
+    let Value::Object(mut map) = raw else {
+        // Not a payload shape the engine can read, but also not ours to break:
+        // every reader in the engine is a `.get` that returns `None`.
         return raw;
     };
 
-    if let Some(session) = object.get("sessionId").cloned() {
-        object.entry("session_id").or_insert(session);
-    }
-    if let Some(tool) = object.get("toolName").cloned() {
-        object.entry("tool_name").or_insert(tool);
-    }
-    if let Some(args) = object.get("toolArgs").cloned() {
-        object.entry("tool_input").or_insert(parse_tool_args(args));
+    if let Some(value) = map.get("sessionId").cloned() {
+        map.entry("session_id").or_insert(value);
     }
 
-    Value::Object(object)
-}
-
-/// Copilot sends `toolArgs` as a JSON string; the engine's matchers want the
-/// object itself. A string that is not JSON is passed through as a string —
-/// fail open, never drop what the host sent.
-fn parse_tool_args(args: Value) -> Value {
-    match args {
-        Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
-        other => other,
+    if let Some(value) = map.get("toolName").cloned() {
+        let normalized = match value.as_str() {
+            Some(name) => Value::from(claude_tool_name(name)),
+            None => value,
+        };
+        map.entry("tool_name").or_insert(normalized);
     }
+
+    if let Some(value) = map.get("toolArgs").cloned() {
+        map.entry("tool_input").or_insert(parse_tool_args(value));
+    }
+
+    Value::Object(map)
 }
 
 /// One line of `{"additionalContext": …}`, which is all Copilot reads.
-///
-/// The text is unwrapped first when the engine emitted a Claude envelope: putting
-/// JSON inside `additionalContext` would show the model the envelope, not the
-/// context.
 pub fn outbound(_event: &str, text: &str) -> Option<String> {
-    Some(serde_json::json!({ "additionalContext": super::context_of(text) }).to_string())
+    let context = super::context_of(text);
+    if context.trim().is_empty() {
+        return None;
+    }
+    Some(json!({ "additionalContext": context }).to_string())
+}
+
+/// Copilot's runtime tool names in the Claude names the engine matches on.
+///
+/// The table is Copilot's own (docs: "Tool names for hook matching"). An
+/// unknown name passes through: a matcher that does not know it does nothing,
+/// which is the correct fail-open answer.
+fn claude_tool_name(name: &str) -> &str {
+    match name {
+        "bash" | "powershell" | "shell" => "Bash",
+        "view" => "Read",
+        "create" => "Write",
+        "edit" | "str_replace_editor" | "apply_patch" => "Edit",
+        "grep" | "rg" => "Grep",
+        "glob" => "Glob",
+        "web_fetch" => "WebFetch",
+        "web_search" => "WebSearch",
+        "ask_user" => "AskUserQuestion",
+        "update_todo" => "TodoWrite",
+        "task" => "Agent",
+        _ => name,
+    }
+}
+
+/// `toolArgs` is documented as a JSON string in the camelCase dialect, and as
+/// an object in the PascalCase one. Parse the string; if it is not JSON, keep
+/// it as-is rather than inventing a shape the host did not send.
+fn parse_tool_args(value: Value) -> Value {
+    if let Value::String(text) = &value
+        && let Ok(parsed) = serde_json::from_str::<Value>(text)
+    {
+        return parsed;
+    }
+    value
 }
 
 pub struct CopilotBinding;
@@ -114,131 +164,250 @@ impl Binding for CopilotBinding {
         copilot_home(home).join("hooks").join("base.json")
     }
 
-    /// Write base's own `base.json`. Idempotent: a second call adds nothing.
+    /// Write `base.json`, preserving any entry base did not write.
     ///
-    /// The file normally does not exist (it is base's alone), so this creates
-    /// `hooks/` when needed. If it does exist — an older base, or an operator
-    /// who put their own hooks there — entries base does not recognise are kept
-    /// and only missing base events are appended.
-    fn wire(&self, home: &Path, _exe: &Path) -> anyhow::Result<WireOutcome> {
+    /// The file is base's own, so a stale base entry is replaced rather than
+    /// duplicated — but a user who added their own hook to it keeps that hook.
+    /// A second call changes nothing.
+    fn wire(&self, home: &Path, _exe: &Path) -> Result<WireOutcome> {
         let path = self.config_path(home);
-        let mut root = if path.exists() {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-            serde_json::from_str(&text)
-                .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", path.display()))?
-        } else {
-            serde_json::json!({ "version": 1, "hooks": {} })
-        };
+        let original = read_config(&path)?;
+        let mut document = original.clone().unwrap_or_else(|| json!({ "version": 1, "hooks": {} }));
 
-        let object = root
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
-        object.entry("version").or_insert(Value::from(1));
-        let hooks = object
-            .entry("hooks")
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("{} has a non-object \"hooks\"", path.display()))?;
+        // The events this call added, and the base entries it dropped (a stale
+        // one, or a duplicate of the one it re-added). Both are "changes" for
+        // the transcript; the document comparison below is what decides whether
+        // anything was written at all.
+        let mut added: Vec<&'static str> = Vec::new();
+        let mut dropped = 0usize;
 
-        let mut added = Vec::new();
-        for (host_event, event) in HOOK_EVENTS {
-            let entries = hooks
-                .entry(host_event)
-                .or_insert_with(|| Value::Array(Vec::new()))
-                .as_array_mut()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("{} has a non-array \"hooks.{host_event}\"", path.display())
+        {
+            let object = document
+                .as_object_mut()
+                .with_context(|| format!("{} is not a JSON object; left untouched", path.display()))?;
+            object.insert("version".to_string(), json!(1));
+            let hooks = object
+                .entry("hooks")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .with_context(|| {
+                    format!("{} is not mergeable: hooks is a non-object; left untouched", path.display())
                 })?;
-            if !entries.iter().any(|entry| names_event(entry, event)) {
-                entries.push(hook_entry(event));
-                added.push(host_event);
+
+            // Events base no longer wires — a future release could drop one —
+            // still lose their stale base entry. Another tool's entries in the
+            // same event stay exactly where they are, and an event base empties
+            // is removed rather than left as an empty array.
+            let stale: Vec<String> = hooks
+                .keys()
+                .filter(|event| !WIRED.iter().any(|&(name, _)| name == event.as_str()))
+                .cloned()
+                .collect();
+            for event in stale {
+                if let Some(entries) = hooks.get_mut(&event).and_then(Value::as_array_mut) {
+                    let before = entries.len();
+                    entries.retain(|existing| !is_base_entry(existing));
+                    dropped += before - entries.len();
+                    if entries.is_empty() {
+                        hooks.remove(&event);
+                    }
+                }
+            }
+
+            for (event, canonical) in WIRED {
+                let desired = entry(canonical);
+                match hooks.get_mut(event).and_then(Value::as_array_mut) {
+                    Some(entries) => {
+                        // Exactly one base entry, the current one, and it keeps
+                        // its place: a rewrite that reorders a file the operator
+                        // has been reading is a diff nobody asked for.
+                        let mut kept = false;
+                        let mut merged = Vec::with_capacity(entries.len() + 1);
+                        for existing in entries.drain(..) {
+                            if is_base_entry(&existing) {
+                                if !kept && existing == desired {
+                                    merged.push(desired.clone());
+                                    kept = true;
+                                } else {
+                                    dropped += 1;
+                                }
+                            } else {
+                                merged.push(existing);
+                            }
+                        }
+                        if !kept {
+                            merged.push(desired);
+                            added.push(event);
+                        }
+                        *entries = merged;
+                    }
+                    None => {
+                        hooks.insert(event.to_string(), json!([desired]));
+                        added.push(event);
+                    }
+                }
             }
         }
 
-        if added.is_empty() {
+        if original.as_ref() == Some(&document) {
             return Ok(WireOutcome::unchanged(path, "already wired"));
         }
 
-        write_json(&path, &root)?;
-        Ok(WireOutcome {
-            path,
-            changed: added.len(),
-            note: format!("added {}", added.join(", ")),
-        })
+        let changed = added.len() + dropped;
+        write_config(&path, &document)?;
+        let note = if added.is_empty() {
+            format!("updated {changed} base hook {}", if changed == 1 { "entry" } else { "entries" })
+        } else {
+            format!("added {}", added.join(", "))
+        };
+        Ok(WireOutcome { path, changed, note })
     }
 
-    /// Remove base's entries, and the whole file when it holds nothing else.
-    ///
-    /// `base.json` is base's file, so a file whose every hook entry names
-    /// `base hook` is deleted outright. A file that also holds another tool's
-    /// entries keeps them: only base's entries go, and arrays that became empty
-    /// because base's entry left are dropped.
-    fn unwire(&self, home: &Path) -> anyhow::Result<WireOutcome> {
+    /// Remove base's entries. The file is deleted only when every command in it
+    /// is base's; a file that has grown a foreign hook is edited, not deleted.
+    fn unwire(&self, home: &Path) -> Result<WireOutcome> {
         let path = self.config_path(home);
-        if !path.exists() {
+        let Some(mut document) = read_config(&path)? else {
             return Ok(WireOutcome::unchanged(path, "not wired"));
-        }
-
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        let mut root: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", path.display()))?;
-        let object = root
-            .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", path.display()))?;
-
-        // Decided before anything is removed: a file is base's only when every
-        // entry in it is, and it has no top-level key base never wrote.
-        let only_base = object.keys().all(|key| key == "version" || key == "hooks")
-            && object
-                .get("hooks")
-                .and_then(Value::as_object)
-                .is_some_and(|hooks| {
-                    !hooks.is_empty()
-                        && hooks.values().all(|entries| {
-                            entries
-                                .as_array()
-                                .is_some_and(|a| !a.is_empty() && a.iter().all(is_base_entry))
-                        })
-                });
-
-        let hooks = match object.get_mut("hooks").and_then(Value::as_object_mut) {
-            Some(hooks) => hooks,
-            None => return Ok(WireOutcome::unchanged(path, "no base hooks")),
         };
 
+        if all_base(&document) {
+            let removed = entry_count(&document);
+            let note = format!("removed {removed} base hook {}", if removed == 1 { "entry" } else { "entries" });
+            fs::remove_file(&path)
+                .with_context(|| format!("could not remove {}", path.display()))?;
+            return Ok(WireOutcome { path, changed: removed, note });
+        }
+
+        let object = document
+            .as_object_mut()
+            .with_context(|| format!("{} is not a JSON object; left untouched", path.display()))?;
+        let Some(hooks) = object.get_mut("hooks") else {
+            return Ok(WireOutcome::unchanged(path, "no base hooks"));
+        };
+        let hooks = hooks
+            .as_object_mut()
+            .with_context(|| format!("{}.hooks is not a JSON object; left untouched", path.display()))?;
+
         let mut removed = 0usize;
-        for entries in hooks.values_mut() {
-            if let Some(array) = entries.as_array_mut() {
-                let before = array.len();
-                array.retain(|entry| !is_base_entry(entry));
-                removed += before - array.len();
+        let mut empty = Vec::new();
+        for (event, value) in hooks.iter_mut() {
+            let entries = value
+                .as_array_mut()
+                .with_context(|| format!("{}.hooks.{event} is not an array; left untouched", path.display()))?;
+            let before = entries.len();
+            entries.retain(|existing| !is_base_entry(existing));
+            removed += before - entries.len();
+            if entries.is_empty() {
+                empty.push(event.clone());
             }
+        }
+        for event in empty {
+            hooks.remove(&event);
         }
 
         if removed == 0 {
             return Ok(WireOutcome::unchanged(path, "no base hooks"));
         }
 
-        if only_base {
-            std::fs::remove_file(&path)
-                .map_err(|e| anyhow::anyhow!("deleting {}: {e}", path.display()))?;
-            return Ok(WireOutcome {
-                path,
-                changed: removed,
-                note: format!("removed {removed} entries and deleted the file"),
-            });
-        }
-
-        hooks.retain(|_, entries| entries.as_array().is_none_or(|a| !a.is_empty()));
-        write_json(&path, &root)?;
+        write_config(&path, &document)?;
         Ok(WireOutcome {
             path,
             changed: removed,
-            note: format!("removed {removed} entries"),
+            note: format!("removed {removed} base hook {}", if removed == 1 { "entry" } else { "entries" }),
         })
     }
+}
+
+/// The command and entry base writes for one event.
+///
+/// PATH-relative on purpose, like [`crate::install::HOOK_TABLE`]: `base install`
+/// puts the binary on `PATH`, and a config that pins an absolute path breaks
+/// when the binary moves. The `exe` argument exists for a host that cannot rely
+/// on `PATH`; Copilot runs command hooks in the user's shell, so it can.
+fn entry(canonical: &str) -> Value {
+    let command = format!("{BASE_COMMAND} {canonical} --harness copilot");
+    json!({
+        "type": "command",
+        "bash": command,
+        "powershell": command,
+        "timeoutSec": TIMEOUT_SEC,
+    })
+}
+
+/// Whether one hook entry is one base wrote.
+///
+/// Every command field on the entry has to name base; an entry that mixes a
+/// base command with a foreign one is not clearly ours and is left alone.
+fn is_base_entry(entry: &Value) -> bool {
+    let Some(object) = entry.as_object() else {
+        return false;
+    };
+    let mut seen = false;
+    for key in ["bash", "powershell", "command", "exec"] {
+        if let Some(command) = object.get(key).and_then(Value::as_str) {
+            seen = true;
+            if !command.contains(BASE_COMMAND) {
+                return false;
+            }
+        }
+    }
+    seen
+}
+
+/// Whether every hook entry in the document is base's, so the file can go.
+fn all_base(document: &Value) -> bool {
+    let Some(hooks) = document.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    let mut entries = 0usize;
+    for value in hooks.values() {
+        let Some(list) = value.as_array() else {
+            return false;
+        };
+        for entry in list {
+            if !is_base_entry(entry) {
+                return false;
+            }
+            entries += 1;
+        }
+    }
+    entries > 0
+}
+
+fn entry_count(document: &Value) -> usize {
+    document
+        .get("hooks")
+        .and_then(Value::as_object)
+        .map(|hooks| {
+            hooks
+                .values()
+                .filter_map(Value::as_array)
+                .map(Vec::len)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn read_config(path: &Path) -> Result<Option<Value>> {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON; left untouched", path.display()))
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+    }
+}
+
+fn write_config(path: &Path, document: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let mut text = serde_json::to_string_pretty(document)
+        .with_context(|| format!("could not encode {}", path.display()))?;
+    text.push('\n');
+    fs::write(path, text).with_context(|| format!("could not write {}", path.display()))
 }
 
 /// `COPILOT_HOME` when set, else `~/.copilot`.
@@ -246,112 +415,5 @@ fn copilot_home(home: &Path) -> PathBuf {
     match std::env::var_os("COPILOT_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => home.join(".copilot"),
-    }
-}
-
-fn hook_command(event: &str) -> String {
-    format!("base hook {event} --harness copilot")
-}
-
-fn hook_entry(event: &str) -> Value {
-    let command = hook_command(event);
-    serde_json::json!({
-        "type": "command",
-        "bash": command.clone(),
-        "powershell": command,
-        "timeoutSec": TIMEOUT_SECS,
-    })
-}
-
-/// Whether `entry` already serves `event`: an entry base wrote for this event,
-/// with or without the `--harness copilot` suffix older releases omitted.
-fn names_event(entry: &Value, event: &str) -> bool {
-    let wanted = format!("base hook {event}");
-    COMMAND_KEYS.iter().any(|key| {
-        entry
-            .get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|command| command.contains(&wanted))
-    })
-}
-
-/// Whether every command in `entry` names base's hook. An entry with no command
-/// field at all is not base's; neither is one that carries another tool's
-/// command beside base's, because removing it would take that other tool's hook
-/// with it.
-fn is_base_entry(entry: &Value) -> bool {
-    let mut found = false;
-    for key in COMMAND_KEYS {
-        if let Some(command) = entry.get(key).and_then(Value::as_str) {
-            found = true;
-            if !command.contains("base hook") {
-                return false;
-            }
-        }
-    }
-    found
-}
-
-fn write_json(path: &Path, root: &Value) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
-    }
-    let mut text = serde_json::to_string_pretty(root)?;
-    text.push('\n');
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &text).map_err(|e| anyhow::anyhow!("writing {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| anyhow::anyhow!("renaming {} to {}: {e}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_event_has_a_command_for_both_shells() {
-        for (host_event, event) in HOOK_EVENTS {
-            let entry = hook_entry(event);
-            assert_eq!(entry["type"], "command", "{host_event}");
-            let expected = format!("base hook {event} --harness copilot");
-            assert_eq!(entry["bash"], expected, "{host_event}");
-            assert_eq!(entry["powershell"], expected, "{host_event}");
-            assert_eq!(entry["timeoutSec"], TIMEOUT_SECS, "{host_event}");
-        }
-    }
-
-    #[test]
-    fn an_entry_with_one_command_outside_base_is_not_base_owned() {
-        let mixed = serde_json::json!({
-            "bash": "base hook stop --harness copilot",
-            "powershell": "other-tool stop",
-        });
-        assert!(
-            !is_base_entry(&mixed),
-            "removing it would remove the other tool's hook"
-        );
-        assert!(is_base_entry(&hook_entry("stop")));
-        assert!(!is_base_entry(&serde_json::json!({ "type": "prompt" })));
-    }
-
-    #[test]
-    fn a_legacy_base_command_still_counts_as_wired() {
-        let legacy = serde_json::json!({ "bash": "base hook session-start" });
-        assert!(names_event(&legacy, "session-start"));
-        assert!(!names_event(&legacy, "stop"));
-    }
-
-    #[test]
-    fn tool_args_as_a_json_string_become_the_engine_input() {
-        let got = parse_tool_args(Value::String(r#"{"command":"ls -la"}"#.into()));
-        assert_eq!(got["command"], "ls -la");
-    }
-
-    #[test]
-    fn a_string_that_is_not_json_survives_intact() {
-        assert_eq!(parse_tool_args(Value::String("ls -la".into())), "ls -la");
-        assert_eq!(parse_tool_args(Value::Null), Value::Null);
     }
 }
